@@ -12,7 +12,7 @@ export function getStripe(): Stripe {
     throw new Error("Stripe is not configured. Set STRIPE_SECRET_KEY in your environment.")
   }
 
-  const apiVersion: Stripe.StripeConfig["apiVersion"] = "2024-06-20"
+  const apiVersion: Stripe.StripeConfig["apiVersion"] = "2026-09-30.endive"
   return new Stripe(stripeSecretKey, { apiVersion })
 }
 
