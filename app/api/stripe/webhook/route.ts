@@ -10,6 +10,55 @@ import { isLikelyTransientError, RetryExhaustedError, retryWithBackoff } from "@
 import { getStripe } from "@/lib/stripe"
 import type { Database, Json, TablesInsert } from "@/lib/supabase"
 
+type PeriodItem = { price?: { id?: string } | null };
+type PeriodField = 'current_period_start' | 'current_period_end';
+type PlanItem = (items: PeriodItem[]) => PeriodItem | undefined;
+
+// Typed like the removed field, which was also absent at runtime when Stripe omitted it.
+function subscriptionPeriod(subscription: object, field: PeriodField, planItem?: PlanItem): number {
+  const legacy: unknown = Reflect.get(subscription, field);
+  if (typeof legacy === 'number') return legacy;
+  const list: unknown = Reflect.get(subscription, 'items');
+  const data: unknown = list && typeof list === 'object' ? Reflect.get(list, 'data') : undefined;
+  const items = (Array.isArray(data) ? data : []).filter(
+    (item): item is PeriodItem => typeof item === 'object' && item !== null,
+  );
+  const periods = new Set(items.map((item) => Reflect.get(item, field)));
+  const chosen = periods.size === 1 ? items[0] : planItem?.(items);
+  const value: unknown = chosen ? Reflect.get(chosen, field) : undefined;
+  return (typeof value === 'number' ? value : undefined) as number;
+}
+
+function getSubscriptionPeriodStart(subscription: object, planItem?: PlanItem): number {
+  return subscriptionPeriod(subscription, 'current_period_start', planItem);
+}
+
+function getSubscriptionPeriodEnd(subscription: object, planItem?: PlanItem): number {
+  return subscriptionPeriod(subscription, 'current_period_end', planItem);
+}
+
+// Typed like the removed field under old stripe types, like the new location under new ones.
+type InvoiceSubscription<T> = T extends { subscription: infer S }
+  ? S
+  : T extends { parent: infer P }
+    ? NonNullable<P> extends { subscription_details: infer D }
+      ? NonNullable<D> extends { subscription: infer S }
+        ? S | null
+        : string | null
+      : string | null
+    : string | null;
+
+// The old top-level field when present (old-version payloads), otherwise the new location.
+function getInvoiceSubscription<T extends object>(invoice: T): InvoiceSubscription<T> {
+  const legacy: unknown = Reflect.get(invoice, 'subscription');
+  const parent: unknown = Reflect.get(invoice, 'parent');
+  const details: unknown =
+    parent && typeof parent === 'object' ? Reflect.get(parent, 'subscription_details') : undefined;
+  const moved: unknown =
+    details && typeof details === 'object' ? Reflect.get(details, 'subscription') : undefined;
+  return (legacy !== undefined ? legacy : (moved ?? null)) as InvoiceSubscription<T>;
+}
+
 class UnmappedPaymentEventError extends Error {
   eventId: string
   eventType: string
@@ -354,7 +403,8 @@ async function handleInvoicePaymentSucceeded(
   invoice: Stripe.Invoice,
   event: Stripe.Event
 ) {
-  const subscriptionId = typeof invoice.subscription === "string" ? invoice.subscription : invoice.subscription?.id
+  const invoiceSubscription = getInvoiceSubscription(invoice)
+  const subscriptionId = typeof invoiceSubscription === "string" ? invoiceSubscription : invoiceSubscription?.id
 
   if (!subscriptionId) {
     return
@@ -398,11 +448,11 @@ async function handleInvoicePaymentSucceeded(
     tenant_id: tenantId,
     unit_id: unitId,
     payment_method_type: "card",
-    billing_period_start: subscription.current_period_start
-      ? new Date(subscription.current_period_start * 1000).toISOString().split("T")[0]
+    billing_period_start: (getSubscriptionPeriodStart(subscription, (items) => items[0]))
+      ? new Date((getSubscriptionPeriodStart(subscription, (items) => items[0])) * 1000).toISOString().split("T")[0]
       : null,
-    billing_period_end: subscription.current_period_end
-      ? new Date(subscription.current_period_end * 1000).toISOString().split("T")[0]
+    billing_period_end: (getSubscriptionPeriodEnd(subscription, (items) => items[0]))
+      ? new Date((getSubscriptionPeriodEnd(subscription, (items) => items[0])) * 1000).toISOString().split("T")[0]
       : null,
     metadata: {
       invoice_id: invoice.id,
@@ -417,8 +467,8 @@ async function handleInvoicePaymentSucceeded(
     .from("subscriptions")
     .update({
       status: normalizeSubscriptionStatus(subscription.status),
-      current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
-      current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+      current_period_start: new Date((getSubscriptionPeriodStart(subscription, (items) => items[0])) * 1000).toISOString(),
+      current_period_end: new Date((getSubscriptionPeriodEnd(subscription, (items) => items[0])) * 1000).toISOString(),
     })
     .eq("stripe_subscription_id", subscription.id)
 
@@ -432,7 +482,8 @@ async function handleInvoicePaymentFailed(
   invoice: Stripe.Invoice,
   event: Stripe.Event
 ) {
-  const subscriptionId = typeof invoice.subscription === "string" ? invoice.subscription : invoice.subscription?.id
+  const invoiceSubscription = getInvoiceSubscription(invoice)
+  const subscriptionId = typeof invoiceSubscription === "string" ? invoiceSubscription : invoiceSubscription?.id
 
   if (!subscriptionId) {
     return
@@ -502,11 +553,11 @@ async function handleSubscriptionCreated(
     stripe_subscription_id: subscription.id,
     stripe_customer_id: typeof subscription.customer === "string" ? subscription.customer : null,
     status: normalizeSubscriptionStatus(subscription.status),
-    current_period_start: subscription.current_period_start
-      ? new Date(subscription.current_period_start * 1000).toISOString()
+    current_period_start: (getSubscriptionPeriodStart(subscription, (items) => items[0]))
+      ? new Date((getSubscriptionPeriodStart(subscription, (items) => items[0])) * 1000).toISOString()
       : null,
-    current_period_end: subscription.current_period_end
-      ? new Date(subscription.current_period_end * 1000).toISOString()
+    current_period_end: (getSubscriptionPeriodEnd(subscription, (items) => items[0]))
+      ? new Date((getSubscriptionPeriodEnd(subscription, (items) => items[0])) * 1000).toISOString()
       : null,
     cancel_at_period_end: subscription.cancel_at_period_end,
     amount: parseAmountInMajorUnits(subscription.items.data[0]?.price?.unit_amount ?? 0),
@@ -524,11 +575,11 @@ async function handleSubscriptionUpdated(
     .from("subscriptions")
     .update({
       status: normalizeSubscriptionStatus(subscription.status),
-      current_period_start: subscription.current_period_start
-        ? new Date(subscription.current_period_start * 1000).toISOString()
+      current_period_start: (getSubscriptionPeriodStart(subscription, (items) => items[0]))
+        ? new Date((getSubscriptionPeriodStart(subscription, (items) => items[0])) * 1000).toISOString()
         : null,
-      current_period_end: subscription.current_period_end
-        ? new Date(subscription.current_period_end * 1000).toISOString()
+      current_period_end: (getSubscriptionPeriodEnd(subscription, (items) => items[0]))
+        ? new Date((getSubscriptionPeriodEnd(subscription, (items) => items[0])) * 1000).toISOString()
         : null,
       cancel_at_period_end: subscription.cancel_at_period_end,
       metadata: subscription.metadata,
